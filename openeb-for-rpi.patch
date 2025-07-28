@@ -1,0 +1,1654 @@
+diff --git a/cmake/Modules/FindLibUSB.cmake b/cmake/Modules/FindLibUSB.cmake
+index 0cc3fb3..accdf69 100644
+--- a/cmake/Modules/FindLibUSB.cmake
++++ b/cmake/Modules/FindLibUSB.cmake
+@@ -52,7 +52,7 @@ else()
+     )
+ 
+     find_library(LIBUSB_LIBRARY NAMES usb-1.0
+-        PATHS ${PC_LIBUSB_LIBDIR} ${PC_LIBUSB_LIBRARY_DIRS}
++        PATHS ${PC_LIBUSB_LIBDIR} ${PC_LIBUSB_LIBRARY_DIRS} /usr/lib/aarch64-linux-gnu
+     )        
+     
+ endif(MSVC)
+diff --git a/hal_psee_plugins/include/boards/v4l2/dma_buf_heap.h b/hal_psee_plugins/include/boards/v4l2/dma_buf_heap.h
+index 1d8ff47..1339e6c 100644
+--- a/hal_psee_plugins/include/boards/v4l2/dma_buf_heap.h
++++ b/hal_psee_plugins/include/boards/v4l2/dma_buf_heap.h
+@@ -26,10 +26,11 @@
+ 
+ #include <cstring>
+ #include <memory>
+-#include <stdexcept>
+ #include <string>
+ #include <unordered_set>
+ 
++#include "metavision/hal/utils/hal_connection_exception.h"
++
+ namespace Metavision {
+ 
+ class DmaBufHeap {
+@@ -37,10 +38,6 @@ class DmaBufHeap {
+     int heap_fd_;
+     std::unordered_set<unsigned int> buffers_fd_;
+ 
+-    void raise_error(const std::string &str) const {
+-        throw std::runtime_error(str + " (" + std::to_string(errno) + " - " + strerror(errno) + ")");
+-    }
+-
+     std::unordered_set<std::string> get_heap_list(const std::string &heap) {
+         std::unordered_set<std::string> heap_list;
+         std::unique_ptr<DIR, int (*)(DIR *)> dir(opendir(heap.c_str()), closedir);
+@@ -60,8 +57,9 @@ class DmaBufHeap {
+ 
+     int open_heap(const std::string &heap) {
+         int fd = TEMP_FAILURE_RETRY(open(heap.c_str(), O_RDONLY | O_CLOEXEC));
+-        if (fd < 0)
+-            raise_error(heap + " Failed to open the heap.");
++        if (fd < 0) {
++            throw HalConnectionException(errno, std::generic_category(), heap + " Failed to open the heap.");
++        }
+         return fd;
+     }
+ 
+@@ -101,8 +99,8 @@ public:
+ 
+         auto ret = TEMP_FAILURE_RETRY(ioctl(heap_fd_, DMA_HEAP_IOCTL_ALLOC, &heap_data));
+         if (ret < 0) {
+-            // raise_error(heap_ + " Failed to allocate a buffer of " + std::to_string(len) +
+-            //            " bytes from: " + std::to_string(heap_fd_));
++            // throw HalConnectionException(errno, std::generic_category(), heap_ +
++            // " Failed to allocate a buffer of " + std::to_string(len) + " bytes from: " + std::to_string(heap_fd_));
+         } else
+             buffers_fd_.insert(heap_data.fd);
+ 
+diff --git a/hal_psee_plugins/include/boards/v4l2/v4l2_data_transfer.h b/hal_psee_plugins/include/boards/v4l2/v4l2_data_transfer.h
+index c8ec10e..1af53d1 100644
+--- a/hal_psee_plugins/include/boards/v4l2/v4l2_data_transfer.h
++++ b/hal_psee_plugins/include/boards/v4l2/v4l2_data_transfer.h
+@@ -14,6 +14,7 @@
+ 
+ #include "metavision/hal/utils/data_transfer.h"
+ #include "metavision/sdk/base/utils/object_pool.h"
++#include "metavision/psee_hw_layer/utils/psee_format.h"
+ 
+ #include <cstddef>
+ #include <map>
+@@ -26,16 +27,17 @@
+ namespace Metavision {
+ using V4l2Buffer         = struct v4l2_buffer;
+ using V4l2RequestBuffers = struct v4l2_requestbuffers;
++using V4l2BufType        = enum v4l2_buf_type;
+ 
+ class DmaBufHeap;
+ 
+ class V4l2DataTransfer : public DataTransfer::RawDataProducer {
+ public:
+     // Constructor using MMAP buffers
+-    V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes);
++    V4l2DataTransfer(int fd, const StreamFormat& format, uint32_t raw_event_size_bytes);
+ 
+     // Constructor using DMABUF buffers
+-    V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes, const std::string &heap_path, const std::string &heap_name);
++    V4l2DataTransfer(int fd, const StreamFormat& format, uint32_t raw_event_size_bytes, const std::string &heap_path, const std::string &heap_name);
+ 
+     ~V4l2DataTransfer();
+ 
+@@ -46,7 +48,9 @@ private:
+     const enum v4l2_memory memtype_;
+ 
+     const int fd_;
+-
++    V4l2BufType buf_type_;
++    int infer_manual_buf_size;
++    
+     V4l2RequestBuffers request_buffers(uint32_t nb_buffers);
+ 
+     void start_impl() override final;
+@@ -55,9 +59,11 @@ private:
+ 
+     class V4l2Allocator : public std::pmr::memory_resource {
+         size_t buffer_byte_size_{0};
++        V4l2BufType buf_type_;
+ 
+     protected:
+         V4l2Allocator(int videodev_fd);
++        V4l2BufType get_buf_type() const;
+ 
+     public:
+         size_t max_byte_size() const noexcept {
+diff --git a/hal_psee_plugins/include/boards/v4l2/v4l2_device.h b/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
+index c4af025..a4b50fd 100644
+--- a/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
++++ b/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
+@@ -25,11 +25,11 @@
+ #include "metavision/hal/facilities/i_camera_synchronization.h"
+ #include "metavision/hal/utils/device_control.h"
+ #include "metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h"
++#include "metavision/psee_hw_layer/utils/psee_format.h"
++#include "metavision/hal/utils/hal_connection_exception.h"
+ 
+ namespace Metavision {
+ 
+-void raise_error(const std::string &str);
+-
+ using V4l2Capability = struct v4l2_capability;
+ 
+ struct media_entity {
+@@ -41,6 +41,7 @@ struct media_entity {
+ 
+ class V4L2DeviceControl : public DeviceControl {
+     V4l2Capability cap_;
++    enum v4l2_buf_type buf_type_;
+     int media_fd_ = -1;
+     std::vector<media_entity> entities_;
+     std::shared_ptr<V4L2Controls> controls_;
+@@ -61,98 +62,14 @@ public:
+     virtual ~V4L2DeviceControl() = default;
+ 
+     V4l2Capability get_capability() const;
++    const struct media_entity *get_sensor_entity() const;
++    const struct media_entity *get_video_entity() const;
++    bool can_crop(int fd);
++    void set_crop(int fd, const struct v4l2_rect &rect);
++    void get_native_size(int fd, struct v4l2_rect &rect);
++    void get_crop(int fd, struct v4l2_rect &rect);
+ 
+-    int get_media_fd() const {
+-        return media_fd_;
+-    }
+-
+-    const struct media_entity *get_sensor_entity() const {
+-        auto sensor = std::find_if(entities_.begin(), entities_.end(),
+-                                   [](const auto &entity) { return entity.type == MEDIA_ENT_T_V4L2_SUBDEV_SENSOR; });
+-
+-        if (sensor == entities_.end()) {
+-            return nullptr;
+-        }
+-
+-        return &(*sensor);
+-    }
+-
+-    const struct media_entity *get_video_entity() const {
+-        auto video = std::find_if(entities_.begin(), entities_.end(),
+-                                  [](const auto &entity) { return entity.type == MEDIA_ENT_T_DEVNODE_V4L; });
+-
+-        if (video == entities_.end()) {
+-            return nullptr;
+-        }
+-
+-        return &(*video);
+-    }
+-
+-    bool can_crop(int fd) {
+-        struct v4l2_subdev_selection sel = {0};
+-
+-        sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
+-        sel.pad    = 0;
+-        sel.target = V4L2_SEL_TGT_CROP_ACTIVE;
+-        if (ioctl(fd, VIDIOC_SUBDEV_G_CROP, &sel) == -EINVAL) {
+-            MV_HAL_LOG_TRACE() << "device can't crop";
+-            return false;
+-        }
+-        return true;
+-    }
+-
+-    void set_crop(int fd, const struct v4l2_rect &rect) {
+-        struct v4l2_subdev_selection sel = {0};
+-
+-        sel.pad    = 0;
+-        sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
+-        sel.target = V4L2_SEL_TGT_CROP;
+-        sel.r      = rect;
+-        if (ioctl(fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0) {
+-            raise_error("VIDIOC_SUBDEV_S_SELECTION failed");
+-        }
+-    }
+-
+-    void get_native_size(int fd, struct v4l2_rect &rect) {
+-        struct v4l2_subdev_selection sel = {0};
+-
+-        sel.pad    = 0;
+-        sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
+-        sel.target = V4L2_SEL_TGT_NATIVE_SIZE;
+-        if (ioctl(fd, VIDIOC_SUBDEV_G_SELECTION, &sel) < 0) {
+-            raise_error("VIDIOC_SUBDEV_G_SELECTION failed");
+-        }
+-        rect = sel.r;
+-    }
+-
+-    void get_crop(int fd, struct v4l2_rect &rect) {
+-        struct v4l2_subdev_selection sel = {0};
+-
+-        std::memset(&sel, 0, sizeof(sel));
+-        sel.pad    = 0;
+-        sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
+-        sel.target = V4L2_SEL_TGT_CROP;
+-        if (ioctl(fd, VIDIOC_SUBDEV_G_SELECTION, &sel) < 0) {
+-            raise_error("VIDIOC_SUBDEV_G_SELECTION failed");
+-        }
+-        rect = sel.r;
+-    }
+-
+-    int get_height() const {
+-        struct v4l2_format fmt{.type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
+-
+-        if (ioctl(get_video_entity()->fd, VIDIOC_G_FMT, &fmt))
+-            raise_error("VIDIOC_G_FMT failed");
+-
+-        return fmt.fmt.pix.height;
+-    };
+-
+-    int get_width() const {
+-        struct v4l2_format fmt{.type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
+-        if (ioctl(get_video_entity()->fd, VIDIOC_G_FMT, &fmt))
+-            raise_error("VIDIOC_G_FMT failed");
+-        return fmt.fmt.pix.width;
+-    };
++    StreamFormat get_format() const;
+ 
+     int enumerate_entities();
+     std::shared_ptr<V4L2Controls> get_controls();
+@@ -164,22 +81,6 @@ public:
+     virtual void reset() override;
+ };
+ 
+-class V4l2Synchronization : public I_CameraSynchronization {
+-public:
+-    virtual bool set_mode_standalone() override {
+-        return true;
+-    }
+-    virtual bool set_mode_master() override {
+-        return false;
+-    }
+-    virtual bool set_mode_slave() override {
+-        return false;
+-    }
+-    virtual SyncMode get_mode() const override {
+-        return SyncMode::STANDALONE;
+-    }
+-};
+-
+ } // namespace Metavision
+ 
+ #endif // METAVISION_HAL_PSEE_PLUGINS_V4L2_DEVICE_H
+diff --git a/hal_psee_plugins/include/boards/v4l2/v4l2_hardware_identification.h b/hal_psee_plugins/include/boards/v4l2/v4l2_hardware_identification.h
+index 4f6b3fb..2148d8c 100644
+--- a/hal_psee_plugins/include/boards/v4l2/v4l2_hardware_identification.h
++++ b/hal_psee_plugins/include/boards/v4l2/v4l2_hardware_identification.h
+@@ -21,5 +21,8 @@ public:
+ 
+ protected:
+     virtual DeviceConfigOptionMap get_device_config_options_impl() const override;
++
++private:
++    RawFileHeader get_header_impl() const override;
+ };
+-}
++} // namespace Metavision
+diff --git a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/rawfile/psee_raw_file_header.h b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/rawfile/psee_raw_file_header.h
+index 8e3a30c..51f8422 100644
+--- a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/rawfile/psee_raw_file_header.h
++++ b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/rawfile/psee_raw_file_header.h
+@@ -28,7 +28,7 @@ class StreamFormat;
+ /// @brief Convenient class to handle Prophesee RAW files header
+ class PseeRawFileHeader : public RawFileHeader {
+ public:
+-    PseeRawFileHeader(const I_HW_Identification &, const StreamFormat &);
++    explicit PseeRawFileHeader(const I_HW_Identification &hw);
+     PseeRawFileHeader(std::istream &);
+     PseeRawFileHeader(const HeaderMap &);
+     PseeRawFileHeader(const RawFileHeader &);
+@@ -47,10 +47,7 @@ public:
+ 
+ private:
+     void check_header();
+-    void set_serial(std::string);
+     void set_sensor_info(const I_HW_Identification::SensorInfo &);
+-    void set_system_version(long);
+-    void set_format(const StreamFormat &);
+ };
+ 
+ } // namespace Metavision
+diff --git a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
+index 7561b4c..6c6ddf9 100644
+--- a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
++++ b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
+@@ -61,6 +61,7 @@ private:
+     std::mutex tz_control_mutex_;
+     std::string manufacturer;
+     std::string product;
++    std::string serial;
+     time_t build_date;
+     uint32_t version;
+     int sensor_fd_;
+diff --git a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h
+index 7f1ae8d..106c1df 100644
+--- a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h
++++ b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h
+@@ -31,6 +31,7 @@ class V4L2Controls {
+         std::optional<bool> get_bool(void);
+         std::optional<std::string> get_str(void);
+ 
++        [[nodiscard]] int set_menu(int value);
+         [[nodiscard]] int set_int(int value);
+         [[nodiscard]] int set_int64(std::int64_t value);
+         [[nodiscard]] int set_bool(bool value);
+diff --git a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/devices/v4l2/v4l2_sync.h b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/devices/v4l2/v4l2_sync.h
+new file mode 100644
+index 0000000..a42c5bb
+--- /dev/null
++++ b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/devices/v4l2/v4l2_sync.h
+@@ -0,0 +1,36 @@
++/**********************************************************************************************************************
++ * Copyright (c) Prophesee S.A.                                                                                       *
++ *                                                                                                                    *
++ * Licensed under the Apache License, Version 2.0 (the "License");                                                    *
++ * you may not use this file except in compliance with the License.                                                   *
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0                                 *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed   *
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.                      *
++ * See the License for the specific language governing permissions and limitations under the License.                 *
++ **********************************************************************************************************************/
++
++#ifndef METAVISION_HAL_V4L2_SYNC_H
++#define METAVISION_HAL_V4L2_SYNC_H
++
++#include <string>
++#include <map>
++
++#include "metavision/hal/facilities/i_camera_synchronization.h"
++#include "metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h"
++
++namespace Metavision {
++
++class V4l2Synchronization : public I_CameraSynchronization {
++public:
++    V4l2Synchronization(std::shared_ptr<V4L2Controls> controls);
++    virtual bool set_mode_standalone() override;
++    virtual bool set_mode_master() override;
++    virtual bool set_mode_slave() override;
++    virtual SyncMode get_mode() const override;
++private:
++    std::shared_ptr<V4L2Controls> controls_;
++};
++
++} // namespace Metavision
++
++#endif // METAVISION_HAL_V4L2_SYNC_H
+diff --git a/hal_psee_plugins/src/boards/fx3/fx3_hw_identification.cpp b/hal_psee_plugins/src/boards/fx3/fx3_hw_identification.cpp
+index ceb906e..e487745 100644
+--- a/hal_psee_plugins/src/boards/fx3/fx3_hw_identification.cpp
++++ b/hal_psee_plugins/src/boards/fx3/fx3_hw_identification.cpp
+@@ -64,7 +64,7 @@ std::vector<std::string> Fx3HWIdentification::get_available_data_encoding_format
+ }
+ 
+ std::string Fx3HWIdentification::get_current_data_encoding_format() const {
+-    return dev_ctrl_->get_evt_format().name();
++    return dev_ctrl_->get_evt_format().to_string();
+ }
+ 
+ Metavision::I_HW_Identification::SensorInfo Fx3HWIdentification::get_sensor_info() const {
+@@ -107,9 +107,7 @@ Metavision::I_HW_Identification::SystemInfo Fx3HWIdentification::get_system_info
+ }
+ 
+ Metavision::RawFileHeader Fx3HWIdentification::get_header_impl() const {
+-    const StreamFormat &format = dev_ctrl_->get_evt_format();
+-    PseeRawFileHeader header(*this, format);
+-    return header;
++    return PseeRawFileHeader(*this);
+ }
+ 
+ DeviceConfigOptionMap Fx3HWIdentification::get_device_config_options_impl() const {
+diff --git a/hal_psee_plugins/src/boards/rawfile/file_hw_identification.cpp b/hal_psee_plugins/src/boards/rawfile/file_hw_identification.cpp
+index 64d1c7e..2424c20 100644
+--- a/hal_psee_plugins/src/boards/rawfile/file_hw_identification.cpp
++++ b/hal_psee_plugins/src/boards/rawfile/file_hw_identification.cpp
+@@ -41,7 +41,7 @@ std::vector<std::string> FileHWIdentification::get_available_data_encoding_forma
+ }
+ 
+ std::string FileHWIdentification::get_current_data_encoding_format() const {
+-    return raw_header_.get_format().name();
++    return raw_header_.get_format().to_string();
+ }
+ 
+ std::string FileHWIdentification::get_integrator() const {
+diff --git a/hal_psee_plugins/src/boards/rawfile/psee_raw_file_header.cpp b/hal_psee_plugins/src/boards/rawfile/psee_raw_file_header.cpp
+index 4c99b1a..95e0246 100644
+--- a/hal_psee_plugins/src/boards/rawfile/psee_raw_file_header.cpp
++++ b/hal_psee_plugins/src/boards/rawfile/psee_raw_file_header.cpp
+@@ -29,28 +29,31 @@ namespace Metavision {
+ 
+ namespace {
+ 
+-static const std::string format_key           = "format";
+-static const std::string geometry_key         = "geometry";
+-static const std::string sensor_gen_key       = "sensor_generation";
+-static const std::string sensor_name_key      = "sensor_name";
+-static const std::string system_id_key        = "system_ID";
+-static const std::string subsystem_id_key     = "subsystem_ID";
+-static const std::string firmware_version_key = "firmware_version";
+-static const std::string serial_number_key    = "serial_number";
+-static const std::string endianness_key       = "endianness";
+-
+-static const std::string subsystem_id_key_legacy = "sub_system_ID";
+-static const std::string legacy_events_type_key  = "evt";
+-static const std::string legacy_evt3_value       = "3.0";
+-static const std::string legacy_evt2_value       = "2.0";
+-static const std::string legacy_evt21_value      = "2.1";
++constexpr char format_key[]           = "format";
++constexpr char geometry_key[]         = "geometry";
++constexpr char sensor_gen_key[]       = "generation";
++constexpr char sensor_name_key[]      = "sensor_name";
++constexpr char system_id_key[]        = "system_ID";
++constexpr char subsystem_id_key[]     = "subsystem_ID";
++constexpr char firmware_version_key[] = "firmware_version";
++constexpr char serial_number_key[]    = "serial_number";
++constexpr char endianness_key[]       = "endianness";
++
++constexpr char subsystem_id_key_legacy[] = "sub_system_ID";
++constexpr char legacy_events_type_key[]  = "evt";
++constexpr char legacy_evt3_value[]       = "3.0";
++constexpr char legacy_evt2_value[]       = "2.0";
++constexpr char legacy_evt21_value[]      = "2.1";
++constexpr char legacy_sensor_gen_key[]   = "sensor_generation";
+ 
+ } // anonymous namespace
+ 
+-PseeRawFileHeader::PseeRawFileHeader(const I_HW_Identification &hw, const StreamFormat &format) {
+-    set_serial(hw.get_serial());
++PseeRawFileHeader::PseeRawFileHeader(const I_HW_Identification &hw) {
++    // This is redundant with SDK EventFileWriter, but it still needed
++    // if HAL is used directly
++    set_field(serial_number_key, hw.get_serial());
+     set_sensor_info(hw.get_sensor_info());
+-    set_format(format);
++    set_field(format_key, hw.get_current_data_encoding_format());
+ }
+ 
+ PseeRawFileHeader::PseeRawFileHeader(std::istream &stream) : RawFileHeader(stream) {
+@@ -62,10 +65,6 @@ PseeRawFileHeader::PseeRawFileHeader(const HeaderMap &header) : RawFileHeader(he
+ PseeRawFileHeader::PseeRawFileHeader(const RawFileHeader &raw_header) :
+     PseeRawFileHeader(raw_header.get_header_map()) {}
+ 
+-void PseeRawFileHeader::set_serial(std::string serial) {
+-    set_field(serial_number_key, serial);
+-}
+-
+ std::string PseeRawFileHeader::get_serial() const {
+     return get_field(serial_number_key);
+ }
+@@ -109,6 +108,9 @@ void PseeRawFileHeader::set_sensor_info(const I_HW_Identification::SensorInfo &s
+ 
+ I_HW_Identification::SensorInfo PseeRawFileHeader::get_sensor_info() const {
+     std::string generation_str = get_field(sensor_gen_key);
++    if (generation_str.empty()) {
++        generation_str = get_field(legacy_sensor_gen_key);
++    }
+     I_HW_Identification::SensorInfo sensor_info("");
+ 
+     try {
+@@ -136,27 +138,6 @@ I_HW_Identification::SensorInfo PseeRawFileHeader::get_sensor_info() const {
+     return sensor_info;
+ }
+ 
+-void PseeRawFileHeader::set_format(const StreamFormat &format) {
+-    set_field(format_key, format.to_string());
+-    // Keep previous field version for old readers
+-    // Event type
+-    if (format.name() == "EVT2") {
+-        set_field(legacy_events_type_key, legacy_evt2_value);
+-    } else if (format.name() == "EVT3") {
+-        set_field(legacy_events_type_key, legacy_evt3_value);
+-    } else if (format.name() == "EVT21") {
+-        if (format.contains("endianness")) {
+-            set_field(endianness_key, format["endianness"]);
+-        } else {
+-            set_field(endianness_key, "little");
+-        }
+-    }
+-    // Geometry
+-    if (format.contains("width") && format.contains("height")) {
+-        set_field(geometry_key, format["width"] + "x" + format["height"]);
+-    }
+-}
+-
+ StreamFormat PseeRawFileHeader::get_format() const {
+     return StreamFormat(get_field(format_key));
+ }
+@@ -331,7 +312,7 @@ void PseeRawFileHeader::check_header() {
+     }
+ 
+     // Then save everything in the header
+-    set_format(format);
++    set_field(format_key, format.to_string());
+ }
+ 
+ } // namespace Metavision
+diff --git a/hal_psee_plugins/src/boards/treuzell/tz_hw_identification.cpp b/hal_psee_plugins/src/boards/treuzell/tz_hw_identification.cpp
+index afc5e0b..114ce40 100644
+--- a/hal_psee_plugins/src/boards/treuzell/tz_hw_identification.cpp
++++ b/hal_psee_plugins/src/boards/treuzell/tz_hw_identification.cpp
+@@ -61,7 +61,7 @@ std::vector<std::string> TzHWIdentification::get_available_data_encoding_formats
+ }
+ 
+ std::string TzHWIdentification::get_current_data_encoding_format() const {
+-    return devices_[0]->get_output_format().name();
++    return devices_[0]->get_output_format().to_string();
+ }
+ 
+ std::string TzHWIdentification::get_integrator() const {
+@@ -96,9 +96,7 @@ std::string TzHWIdentification::get_connection_type() const {
+ }
+ 
+ RawFileHeader TzHWIdentification::get_header_impl() const {
+-    auto format = devices_[0]->get_output_format();
+-    PseeRawFileHeader header(*this, format);
+-    return header;
++    return PseeRawFileHeader(*this);
+ }
+ 
+ DeviceConfigOptionMap TzHWIdentification::get_device_config_options_impl() const {
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
+index 400e6b9..82580bf 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
+@@ -36,6 +36,7 @@ V4L2BoardCommand::V4L2BoardCommand(std::string device_path) {
+     struct stat st;
+     device_ = std::make_shared<V4L2DeviceControl>(device_path);
+     sensor_fd_ = device_->get_sensor_entity()->fd;
++    serial = device_->get_sensor_entity()->desc.name;
+ }
+ 
+ V4L2BoardCommand::~V4L2BoardCommand() {}
+@@ -69,7 +70,7 @@ std::string V4L2BoardCommand::get_serial() {
+     // TODO: get serial number from media_device,
+     // see https://www.kernel.org/doc/html/v4.9/media/uapi/mediactl/media-ioc-device-info.html
+     // Not available yet with Thor96 setup
+-    return "v4l2_device";
++    return serial;
+ }
+ 
+ // TODO: keep it internal in tz (libusb) board command, and expose generic
+@@ -133,10 +134,10 @@ std::unique_ptr<DataTransfer::RawDataProducer>
+ 
+     // If the environment set a heap, us it, otherwise, use the driver's allocator
+     if (std::getenv("V4L2_HEAP"))
+-        return std::make_unique<V4l2DataTransfer>(device_->get_video_entity()->fd, raw_event_size_bytes, "/dev/dma_heap",
++        return std::make_unique<V4l2DataTransfer>(device_->get_video_entity()->fd, device_->get_format(), raw_event_size_bytes, "/dev/dma_heap",
+                                                   std::getenv("V4L2_HEAP"));
+     else
+-        return std::make_unique<V4l2DataTransfer>(device_->get_video_entity()->fd, raw_event_size_bytes);
++        return std::make_unique<V4l2DataTransfer>(device_->get_video_entity()->fd, device_->get_format(), raw_event_size_bytes);
+ }
+ 
+ } // namespace Metavision
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
+index 4c1ebb4..91df6d8 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
+@@ -23,20 +23,13 @@
+ #include "boards/v4l2/v4l2_data_transfer.h"
+ 
+ #include "metavision/hal/device/device_discovery.h"
+-#include "metavision/hal/facilities/i_camera_synchronization.h"
+-#include "metavision/hal/facilities/i_decoder.h"
+-#include "metavision/hal/facilities/i_events_stream.h"
+-#include "metavision/hal/facilities/i_hw_identification.h"
+-#include "metavision/hal/facilities/i_plugin_software_info.h"
+ #include "metavision/hal/plugin/plugin_entrypoint.h"
+-#include "metavision/hal/utils/camera_discovery.h"
+ #include "metavision/hal/utils/device_builder.h"
+ #include "metavision/hal/utils/hal_log.h"
+ #include "metavision/psee_hw_layer/utils/psee_format.h"
+ #include "metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h"
+ #include <filesystem>
+ 
+-#include "utils/make_decoder.h"
+ 
+ namespace Metavision {
+ 
+@@ -52,6 +45,7 @@ V4l2CameraDiscovery::V4l2CameraDiscovery() {
+             }
+         }
+     }
++    MV_HAL_LOG_TRACE() << "V4l2Discovery: found " << devices_.size() << " devices.";
+ }
+ 
+ bool V4l2CameraDiscovery::is_for_local_camera() const {
+@@ -76,24 +70,25 @@ CameraDiscovery::SystemList V4l2CameraDiscovery::list_available_sources() {
+ 
+ bool V4l2CameraDiscovery::discover(DeviceBuilder &device_builder, const std::string &serial,
+                                    const DeviceConfig &config) {
+-    MV_HAL_LOG_TRACE() << "V4l2Discovery - Discovering...";
+-
+     if (devices_.empty()) {
+         return false;
+     }
+ 
+-    auto &main_device = devices_[0];
++    size_t n_devices  = devices_.size();
++    size_t dev_select = 0;
++
++    for (size_t i = 0; i < n_devices; ++i) {
++        if (devices_[i]->get_serial() == serial) {
++            dev_select = i;
++        }
++    }
+ 
+     auto res = false;
+     try {
+-        res = builder->build_device(main_device, device_builder, config);
++        res = builder->build_device(devices_[dev_select], device_builder, config);
+     } catch (std::exception &e) { MV_HAL_LOG_ERROR() << "Failed to build streaming facilities :" << e.what(); }
+ 
+-    if (res) {
+-        MV_HAL_LOG_TRACE() << "V4l2 Discovery with great success +1";
+-    } else {
+-        MV_HAL_LOG_TRACE() << "V4l2 Discovery failed with horrible failure -1";
+-    }
++    MV_HAL_LOG_TRACE() << "V4l2Discovery " << (res ? "success with serial: " : "failure for serial: ") << serial;
+     return res;
+ }
+ 
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_controls.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_controls.cpp
+index 6014a29..f6669e5 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_controls.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_controls.cpp
+@@ -29,6 +29,8 @@ std::optional<int> V4L2Controls::V4L2Control::get_int(void) {
+ 
+     switch(query_.type) {
+         case V4L2_CTRL_TYPE_INTEGER:
++        case V4L2_CTRL_TYPE_MENU:
++        case V4L2_CTRL_TYPE_INTEGER_MENU:
+             return std::optional<int>(static_cast<int>(ctrl.value));
+         default:
+             return {};
+@@ -71,11 +73,51 @@ std::optional<std::string> V4L2Controls::V4L2Control::get_str(void) {
+     switch(query_.type) {
+         case V4L2_CTRL_TYPE_STRING:
+             return std::string(ctrl.string);
++        case V4L2_CTRL_TYPE_MENU: {
++            struct v4l2_querymenu qmenu = {};
++            qmenu.id = query_.id;
++            qmenu.index = ctrl.value;  // current selected index
++
++            if (ioctl(fd_, VIDIOC_QUERYMENU, &qmenu) == 0) {
++                return std::string(reinterpret_cast<char *>(qmenu.name));
++            } else {
++                perror("VIDIOC_QUERYMENU failed");
++                return {};
++            }
++        }
+         default:
+             return {};
+     }
+ }
+ 
++int V4L2Controls::V4L2Control::set_menu(int value) {
++    // guard: ensure it's a menu type control
++    if (query_.type != V4L2_CTRL_TYPE_MENU && query_.type != V4L2_CTRL_TYPE_INTEGER_MENU)
++        return -EINVAL;
++
++    // guard: check for write-only flag
++    if (query_.flags & V4L2_CTRL_FLAG_WRITE_ONLY)
++        return -EPERM;
++
++    // check value is within menu index range
++    if (value < query_.minimum || value > query_.maximum)
++        return -EINVAL;
++
++    // optional: check if menu index is skipped (driver may report which indices are valid using VIDIOC_QUERYMENU)
++    struct v4l2_querymenu qm = {};
++    qm.id = query_.id;
++    qm.index = value;
++
++    if (ioctl(fd_, VIDIOC_QUERYMENU, &qm) == -1)
++        return -EINVAL;  // invalid/unsupported menu index
++
++    // set control value
++    ctrl.value = value;
++
++    apply();
++    return 0;
++}
++
+ int V4L2Controls::V4L2Control::set_int(int value) {
+     // guards
+     if (query_.flags & V4L2_CTRL_FLAG_WRITE_ONLY)
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_data_transfer.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_data_transfer.cpp
+index 14b52a5..0aaa8e9 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_data_transfer.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_data_transfer.cpp
+@@ -30,7 +30,7 @@ namespace Metavision {
+ static constexpr bool allow_buffer_drop              = true;
+ static constexpr size_t device_buffer_preload_number = 4;
+ 
+-V4l2DataTransfer::V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes) :
++V4l2DataTransfer::V4l2DataTransfer(int fd, const StreamFormat& format, uint32_t raw_event_size_bytes) :
+     memtype_(V4L2_MEMORY_MMAP),
+     fd_(dup(fd)),
+     v4l2_allocator_(std::make_unique<V4l2MmapAllocator>(fd)),
+@@ -38,9 +38,16 @@ V4l2DataTransfer::V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes) :
+     auto res = request_buffers(device_buffer_number);
+     if (res.count != device_buffer_number)
+         throw std::system_error(ENOMEM, std::generic_category(), "Unexpected amount of V4L2 buffers allocated");
++    if(auto env = std::getenv("PSEE_VAR_V4L2_BSIZE"))
++    {
++        if(format.name() == "EVT3")
++            infer_manual_buf_size = 3;
++        else
++            infer_manual_buf_size = 2; // Default to 2 for EVT2 and EVT21
++    }
+ }
+ 
+-V4l2DataTransfer::V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes, const std::string &heap_path,
++V4l2DataTransfer::V4l2DataTransfer(int fd, const StreamFormat& format, uint32_t raw_event_size_bytes, const std::string &heap_path,
+                                    const std::string &heap_name) :
+     memtype_(V4L2_MEMORY_DMABUF),
+     fd_(dup(fd)),
+@@ -49,25 +56,46 @@ V4l2DataTransfer::V4l2DataTransfer(int fd, uint32_t raw_event_size_bytes, const
+     auto res = request_buffers(device_buffer_number);
+     if (res.count != device_buffer_number)
+         throw std::system_error(ENOMEM, std::generic_category(), "Unexpected amount of V4L2 buffers allocated");
++    if(auto env = std::getenv("PSEE_VAR_V4L2_BSIZE"))
++    {
++        if(format.name() == "EVT3")
++            infer_manual_buf_size = 3;
++        else
++            infer_manual_buf_size = 2; // Default to 2 for EVT2 and EVT21
++    }
+ }
+ 
+ V4l2DataTransfer::~V4l2DataTransfer() {
+     // Release the previously acquired buffers
+-    request_buffers(0);
++    try {
++        request_buffers(0);
++    } catch (const std::exception &e) { MV_HAL_LOG_TRACE() << "~V4l2DataTransfer:" << e.what(); }
+     // and release this file handler
+     close(fd_);
+ }
+ 
+ V4l2RequestBuffers V4l2DataTransfer::request_buffers(uint32_t nb_buffers) {
+-    V4l2RequestBuffers req{0};
+-    req.count  = nb_buffers;
+-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    struct v4l2_capability cap = {0};
++    V4l2RequestBuffers req{.count = nb_buffers};
++
++    if (ioctl(fd_, VIDIOC_QUERYCAP, &cap)) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_QUERYCAP failed");
++    }
++
++    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
++        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    } else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    } else {
++        throw HalConnectionException(ENOTSUP, std::generic_category());
++    }
+     req.memory = memtype_;
+ 
+     if (-1 == ioctl(fd_, VIDIOC_REQBUFS, &req)) {
+         throw std::system_error(errno, std::generic_category(), "VIDIOC_REQBUFS failed");
+     }
+ 
++    buf_type_ = (enum v4l2_buf_type)req.type;
+     return req;
+ }
+ 
+@@ -81,12 +109,17 @@ void V4l2DataTransfer::start_impl() {
+     // Since 2 queued buffers are usually enough, and we have 32 of them, queuing 4 should avoid issues with hardware
+     // expecting more, while allowing 28 buffers in parallel (or in a 28-stage pipeline) in the app.
+     for (unsigned int i = 0; i < device_buffer_preload_number; ++i) {
+-        auto input_buff = pool_.acquire();
++        struct v4l2_plane plane = {0};
++        auto input_buff         = pool_.acquire();
+         // Using DMABUF, the allocator handles the pool of buffers through file descriptors, we need to choose a free
+         // index to queue a buffer.
+         // On the other hand, with MMAP, the pool is handled through indices, and fill_v4l2_buffer will fix the index
+         // in the V4l2Buffer descriptor.
+-        V4l2Buffer buffer = {.index = i, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = memtype_};
++        V4l2Buffer buffer = {.index = i, .type = buf_type_, .memory = memtype_};
++        if (buffer.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            buffer.length   = 1;
++            buffer.m.planes = &plane;
++        }
+         fill_v4l2_buffer(input_buff, buffer);
+ 
+         // Update buffer size to its capacity so that it may only be downsized after transfer
+@@ -112,6 +145,8 @@ void V4l2DataTransfer::run_impl(const DataTransfer &data_transfer) {
+ 
+     while (!data_transfer.should_stop()) {
+         V4l2Buffer buf{0};
++        struct v4l2_plane plane;
++        uint32_t bytesused;
+ 
+         if (poll(fds, 1, -1) < 0) {
+             MV_HAL_LOG_ERROR() << "V4l2DataTransfer: poll failed" << strerror(errno);
+@@ -119,28 +154,71 @@ void V4l2DataTransfer::run_impl(const DataTransfer &data_transfer) {
+         }
+ 
+         if (fds[0].revents & POLLERR) {
++            using namespace std::chrono_literals;
+             // When stopping, STREAMOFF ioctl will return all buffers and epoll will signal an error, since there is no
+             // queued buffer anymore. This will usually trig faster than calling DataTransfer::stop, and should_stop()
+             // will still return false, even though I_EventStream is stopping.
+-            // Stop polling and wait for DataTransfer to call stop_impl before cleaning
++            // But this may also happen at start. Wait a bit and retry until should_stop()
+             MV_HAL_LOG_TRACE() << "V4l2DataTransfer: poll returned" << std::hex << fds[0].revents << std::dec;
+-            break;
++            std::this_thread::sleep_for(1ms);
++            continue;
+         }
+ 
+-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.type   = buf_type_;
+         buf.memory = memtype_;
++        if (buf.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            buf.length   = 1;
++            buf.m.planes = &plane;
++        }
+         if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
+             MV_HAL_LOG_ERROR() << "V4l2DataTransfer: DQBUF failed" << strerror(errno);
+             break;
+         }
+ 
+-        MV_HAL_LOG_DEBUG() << "Grabbed buffer" << buf.index << "of:" << buf.bytesused << "Bytes.";
++        if (buf.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++            bytesused = buf.m.planes[0].bytesused;
++        } else {
++            bytesused = buf.bytesused;
++        }
++        MV_HAL_LOG_DEBUG() << "Grabbed buffer" << buf.index << "of:" << bytesused << "Bytes.";
+ 
+         // Advertise CPU operations to allow cache maintenance
+         begin_cpu_access(queued_buffers_[buf.index]);
+ 
+-        // Get the vector corresponding to this buffer and transfer the data
+-        queued_buffers_[buf.index]->resize(buf.bytesused);
++        if(infer_manual_buf_size > 0)
++        {
++            size_t new_size = buf.bytesused; // default: keep full size
++            if(infer_manual_buf_size == 3) {
++                // 16 bit (for evt3)
++                uint16_t* buffer = reinterpret_cast<uint16_t*>(queued_buffers_[buf.index]->data());
++                size_t new_size_16 = new_size / sizeof(uint16_t);
++                for (size_t i = 0; i < new_size_16; ++i) {
++                    if (buffer[i] == 0xE019) {
++                        //MV_HAL_LOG_TRACE() << "Found eof marker at index" << i*sizeof(uint16_t);
++                        new_size = i*sizeof(uint16_t); // keep up to this pattern
++                        break;
++                    }
++                }
++            }
++            else //if(infer_manual_buf_size == 2 || infer_manual_buf_size == 21) 
++            {
++                // 64 bit for evt2 and evt21
++                uint64_t* buffer = reinterpret_cast<uint64_t*>(queued_buffers_[buf.index]->data());
++                size_t new_size_64 = new_size / sizeof(uint64_t);
++                for (size_t i = 0; i < new_size_64; ++i) {
++                    if ((buffer[i] & 0xE00000FF00000000) == 0xE000001900000000) {
++                        //MV_HAL_LOG_TRACE() << "Found eof marker at index" << i*sizeof(uint64_t);
++                        new_size = i*sizeof(uint64_t); // keep up to this pattern
++                        break;
++                    }
++                }
++            } 
++            queued_buffers_[buf.index]->resize(new_size);
++        }
++        else {
++            // Get the vector corresponding to this buffer and transfer the data
++            queued_buffers_[buf.index]->resize(bytesused);
++        }
+ 
+         // Transfer the data for processing
+         // if there is no more available buffer and buffer drop is allowed,
+@@ -221,16 +299,35 @@ void V4l2DataTransfer::end_cpu_access(BufferPtr &buf) const {
+ }
+ 
+ V4l2DataTransfer::V4l2Allocator::V4l2Allocator(int videodev_fd) {
+-    struct v4l2_format format {
+-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+-    };
++    struct v4l2_capability cap = {0};
++
++    if (ioctl(videodev_fd, VIDIOC_QUERYCAP, &cap)) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_QUERYCAP failed");
++    }
+ 
++    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    } else if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    } else {
++        throw HalConnectionException(ENOTSUP, std::generic_category());
++    }
++
++    struct v4l2_format format = {.type = buf_type_};
+     // Technically, the format is not locked yet, it will be locked when V4l2DataTransfer constructor does
+     // request_buffers, but we need to build the BufferPool with an Allocator first
+     if (ioctl(videodev_fd, VIDIOC_G_FMT, &format))
+         throw std::system_error(errno, std::generic_category(), "VIDIOC_G_FMT failed");
+ 
+-    buffer_byte_size_ = format.fmt.pix.sizeimage;
++    if (buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++        buffer_byte_size_ = format.fmt.pix_mp.plane_fmt[0].sizeimage;
++    } else {
++        buffer_byte_size_ = format.fmt.pix.sizeimage;
++    }
++}
++
++V4l2BufType V4l2DataTransfer::V4l2Allocator::get_buf_type() const {
++    return buf_type_;
+ }
+ 
+ } // namespace Metavision
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
+index 68192d6..5551c76 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
+@@ -27,67 +27,216 @@
+ 
+ using namespace Metavision;
+ 
+-void Metavision::raise_error(const std::string &str) {
+-    throw std::runtime_error(str + " (" + std::to_string(errno) + " - " + std::strerror(errno) + ")");
+-}
+-
+ V4L2DeviceControl::V4L2DeviceControl(const std::string &devpath) {
+     struct stat st;
+-    if (-1 == stat(devpath.c_str(), &st))
+-        raise_error(devpath + "Cannot identify device.");
++    if (-1 == stat(devpath.c_str(), &st)) {
++        throw HalConnectionException(errno, std::generic_category(), devpath + "Cannot identify device.");
++    }
+ 
+-    if (!S_ISCHR(st.st_mode))
+-        throw std::runtime_error(devpath + " is not a device");
++    if (!S_ISCHR(st.st_mode)) {
++        throw HalConnectionException(ENODEV, std::generic_category(), devpath + " is not a device");
++    }
+ 
+     media_fd_ = open(devpath.c_str(), O_RDWR | O_NONBLOCK, 0);
+     if (-1 == media_fd_) {
+-        raise_error(devpath + "Cannot open media device");
++        throw HalConnectionException(errno, std::generic_category(), devpath + "Cannot open media device");
+     }
+ 
+     enumerate_entities();
+ 
+     auto video_ent = get_video_entity();
+-    if (video_ent == nullptr) {
+-        throw std::runtime_error("Could not find a v4l2 video device");
+-    }
+ 
+     if (ioctl(video_ent->fd, VIDIOC_QUERYCAP, &cap_)) {
+-        if (EINVAL == errno) {
+-            throw std::runtime_error(devpath + " is not a V4L2 device");
+-        } else {
+-            raise_error("VIDIOC_QUERYCAP failed");
+-        }
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_QUERYCAP failed");
+     }
+ 
+-    if (!(cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE))
+-        throw std::runtime_error(devpath + " is not video capture device");
+-
+-    if (!(cap_.capabilities & V4L2_CAP_STREAMING))
+-        throw std::runtime_error(devpath + " does not support streaming i/o");
++    if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    } else if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    } else {
++        throw HalConnectionException(ENOTSUP, std::generic_category(), devpath + " is not video capture device");
++    }
+ 
+-    auto sensor_ent = get_sensor_entity();
+-    if (sensor_ent == nullptr) {
+-        throw std::runtime_error("Could not find a v4l2 sensor subdevice");
++    if (!(cap_.capabilities & V4L2_CAP_STREAMING)) {
++        throw HalConnectionException(ENOTSUP, std::generic_category(), devpath + " does not support streaming i/o");
+     }
+ 
+     // only expose sensor controls for now
+-    controls_ = std::make_shared<V4L2Controls>(sensor_ent->fd);
++    controls_ = std::make_shared<V4L2Controls>(get_sensor_entity()->fd);
+     // Note: this code expects the V4L2 device to be configured to output a supported format
+ }
+ 
++StreamFormat V4L2DeviceControl::get_format() const {
++    uint32_t width, height;
++    struct v4l2_format fmt = {.type = buf_type_};
++    struct v4l2_subdev_selection crop_bound {
++        .which = V4L2_SUBDEV_FORMAT_ACTIVE, .pad = 0, .target = V4L2_SEL_TGT_CROP_BOUNDS,
++    };
++
++    if (ioctl(get_video_entity()->fd, VIDIOC_G_FMT, &fmt) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_G_FMT failed");
++    }
++
++    /* v4l2_pix_format_mplane and v4l2_pix_format both start with
++     * width, height, pixelformat
++     * thus we can disregard the actual fmt.type
++     */
++    if (ioctl(get_sensor_entity()->fd, VIDIOC_SUBDEV_G_SELECTION, &crop_bound) < 0) {
++        MV_HAL_LOG_TRACE() << "Could not get CROP_BOUND selection, using V4L2 format";
++        width  = fmt.fmt.pix.width;
++        height = fmt.fmt.pix.height;
++    } else {
++        /* V4L2 format is likely to be derived from media pad information, but, with
++         * an event-based sensor, the packetization on streaming interfaces, such as
++         * MIPI CSI-2, is independant from the sensor resolution. Since there should
++         * be no event outside the crop bounds, processing should also happen within
++         * those bounds
++         */
++        width  = crop_bound.r.width;
++        height = crop_bound.r.height;
++    }
++
++    switch (fmt.fmt.pix.pixelformat) {
++    case v4l2_fourcc('P', 'S', 'E', 'E'): {
++        StreamFormat format("EVT2");
++        format["width"]  = std::to_string(width);
++        format["height"] = std::to_string(height);
++        return format.to_string();
++    }
++    case v4l2_fourcc('P', 'S', 'E', '1'): {
++        StreamFormat format("EVT21");
++        format["endianness"] = "legacy";
++        format["width"]      = std::to_string(width);
++        format["height"]     = std::to_string(height);
++        return format.to_string();
++    }
++    case v4l2_fourcc('P', 'S', 'E', '2'): {
++        StreamFormat format("EVT21");
++        format["width"]  = std::to_string(width);
++        format["height"] = std::to_string(height);
++        return format;
++    }
++    case v4l2_fourcc('P', 'S', 'E', '3'): {
++        StreamFormat format("EVT3");
++        format["width"]  = std::to_string(width);
++        format["height"] = std::to_string(height);
++        return format;
++    }
++    case v4l2_fourcc('G', 'R', 'E', 'Y'): {
++        // evt format is supplied as user ctrl
++        if(controls_->has("evt_format"))
++        {
++            auto& ctrl = controls_->get("evt_format");
++            auto evtf = *ctrl.get_str();
++            bool is_legacy = evtf == "EVT21ME";
++
++            if(is_legacy)
++                evtf = "EVT21";
++
++            StreamFormat format(evtf);
++            if(is_legacy)
++                format["endianness"] = "legacy";
++
++            format["width"]  = std::to_string(width);
++            format["height"] = std::to_string(height);
++            return format.to_string();
++        }
++        else
++            throw std::runtime_error("Unsupported pixel format");
++    }
++    default:
++        throw std::runtime_error("Unsupported pixel format");
++    }
++}
++
+ V4l2Capability V4L2DeviceControl::get_capability() const {
+     return cap_;
+ }
+ 
++const struct media_entity *V4L2DeviceControl::get_sensor_entity() const {
++    auto sensor = std::find_if(entities_.begin(), entities_.end(),
++                               [](const auto &entity) { return entity.type == MEDIA_ENT_T_V4L2_SUBDEV_SENSOR; });
++
++    if (sensor == entities_.end()) {
++        throw HalConnectionException(ENODEV, std::generic_category(), "Could not find a v4l2 sensor subdevice");
++    }
++
++    return &(*sensor);
++}
++
++const struct media_entity *V4L2DeviceControl::get_video_entity() const {
++    auto video = std::find_if(entities_.begin(), entities_.end(),
++                              [](const auto &entity) { return entity.type == MEDIA_ENT_T_DEVNODE_V4L; });
++
++    if (video == entities_.end()) {
++        throw HalConnectionException(ENODEV, std::generic_category(), "Could not find a v4l2 video device");
++    }
++
++    return &(*video);
++}
++
++bool V4L2DeviceControl::can_crop(int fd) {
++    struct v4l2_subdev_selection sel = {0};
++
++    sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
++    sel.pad    = 0;
++    sel.target = V4L2_SEL_TGT_CROP_ACTIVE;
++    if (ioctl(fd, VIDIOC_SUBDEV_G_CROP, &sel) == -EINVAL) {
++        MV_HAL_LOG_TRACE() << "device can't crop";
++        return false;
++    }
++    return true;
++}
++
++void V4L2DeviceControl::set_crop(int fd, const struct v4l2_rect &rect) {
++    struct v4l2_subdev_selection sel = {0};
++
++    sel.pad    = 0;
++    sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
++    sel.target = V4L2_SEL_TGT_CROP;
++    sel.r      = rect;
++    if (ioctl(fd, VIDIOC_SUBDEV_S_SELECTION, &sel) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_SUBDEV_S_SELECTION failed");
++    }
++}
++
++void V4L2DeviceControl::get_native_size(int fd, struct v4l2_rect &rect) {
++    struct v4l2_subdev_selection sel = {0};
++
++    sel.pad    = 0;
++    sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
++    sel.target = V4L2_SEL_TGT_NATIVE_SIZE;
++    if (ioctl(fd, VIDIOC_SUBDEV_G_SELECTION, &sel) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_SUBDEV_G_SELECTION failed");
++    }
++    rect = sel.r;
++}
++
++void V4L2DeviceControl::get_crop(int fd, struct v4l2_rect &rect) {
++    struct v4l2_subdev_selection sel = {0};
++
++    std::memset(&sel, 0, sizeof(sel));
++    sel.pad    = 0;
++    sel.which  = V4L2_SUBDEV_FORMAT_ACTIVE;
++    sel.target = V4L2_SEL_TGT_CROP;
++    if (ioctl(fd, VIDIOC_SUBDEV_G_SELECTION, &sel) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_SUBDEV_G_SELECTION failed");
++    }
++    rect = sel.r;
++}
++
+ void V4L2DeviceControl::start() {
+-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    if (ioctl(get_video_entity()->fd, VIDIOC_STREAMON, &type))
+-        raise_error("VIDIOC_STREAMON failed");
++    enum v4l2_buf_type type = buf_type_;
++    if (ioctl(get_video_entity()->fd, VIDIOC_STREAMON, &type) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_STREAMON failed");
++    }
+ }
+ void V4L2DeviceControl::stop() {
+-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    if (ioctl(get_video_entity()->fd, VIDIOC_STREAMOFF, &type))
+-        raise_error("VIDIOC_STREAMOFF failed");
++    enum v4l2_buf_type type = buf_type_;
++    if (ioctl(get_video_entity()->fd, VIDIOC_STREAMOFF, &type) < 0) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_STREAMOFF failed");
++    }
+ }
+ void V4L2DeviceControl::reset() {}
+ 
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_dmabuf_allocator.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_dmabuf_allocator.cpp
+index efc43c2..a6e9f0b 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_dmabuf_allocator.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_dmabuf_allocator.cpp
+@@ -59,7 +59,13 @@ bool V4l2DataTransfer::DmabufAllocator::do_is_equal(const std::pmr::memory_resou
+ }
+ 
+ void V4l2DataTransfer::DmabufAllocator::fill_v4l2_buffer(void *vaddr, V4l2Buffer &buf) const {
+-    buf.m.fd = fd(vaddr);
++    if (buf.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++        buf.m.planes[0].m.fd = fd(vaddr);
++    } else if (buf.type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
++        buf.m.fd = fd(vaddr);
++    } else {
++        throw HalConnectionException(ENOTSUP, std::generic_category());
++    }
+ }
+ 
+ void V4l2DataTransfer::DmabufAllocator::begin_cpu_access(void *vaddr) const {
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_hardware_identification.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_hardware_identification.cpp
+index 81e3501..62cb2f1 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_hardware_identification.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_hardware_identification.cpp
+@@ -2,6 +2,7 @@
+ #include "metavision/hal/facilities/i_plugin_software_info.h"
+ #include "boards/v4l2/v4l2_device.h"
+ #include "metavision/psee_hw_layer/utils/psee_format.h"
++#include "metavision/psee_hw_layer/boards/rawfile/psee_raw_file_header.h"
+ #include <fcntl.h>
+ 
+ namespace Metavision {
+@@ -20,63 +21,22 @@ I_HW_Identification::SensorInfo V4l2HwIdentification::get_sensor_info() const {
+     } else if (ent_name.find("genx320") == 0) {
+         return {320, 0, "GenX320"};
+     } else {
+-        raise_error("Unknown sensor");
++        return {0, 0, "Unknown sensor"};
+     }
+ }
+ 
+ std::vector<std::string> V4l2HwIdentification::get_available_data_encoding_formats() const {
+-    // @TODO Retrieve those info through V4L2
+-    auto format = get_current_data_encoding_format();
+-    auto pos = format.find(";");
+-    if (pos != std::string::npos) {
+-        auto evt_type = format.substr(0, pos);
+-        return {evt_type};
+-    }
+-    return {};
++    StreamFormat format(get_current_data_encoding_format());
++    return {format.name()};
+ }
+ 
+ std::string V4l2HwIdentification::get_current_data_encoding_format() const {
+-    struct v4l2_format fmt {
+-        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE
+-    };
+-
+-    if (ioctl(ctrl_->get_video_entity()->fd, VIDIOC_G_FMT, &fmt))
+-        raise_error("VIDIOC_G_FMT failed");
+-
+-    switch (fmt.fmt.pix.pixelformat) {
+-    case v4l2_fourcc('P', 'S', 'E', 'E'): {
+-        StreamFormat format("EVT2");
+-        format["width"]                    = std::to_string(fmt.fmt.pix.width);
+-        format["height"]                   = std::to_string(fmt.fmt.pix.height);
+-        return format.to_string();
+-    }
+-    case v4l2_fourcc('P', 'S', 'E', '1'): {
+-        StreamFormat format("EVT21");
+-        format["endianness"]               = "legacy";
+-        format["width"]                    = std::to_string(fmt.fmt.pix.width);
+-        format["height"]                   = std::to_string(fmt.fmt.pix.height);
+-        return format.to_string();
+-    }
+-    case v4l2_fourcc('P', 'S', 'E', '2'): {
+-        StreamFormat format("EVT21");
+-        format["width"]                    = std::to_string(fmt.fmt.pix.width);
+-        format["height"]                   = std::to_string(fmt.fmt.pix.height);
+-        return format.to_string();
+-    }
+-    case v4l2_fourcc('P', 'S', 'E', '3'): {
+-        StreamFormat format("EVT3");
+-        format["width"]                    = std::to_string(fmt.fmt.pix.width);
+-        format["height"]                   = std::to_string(fmt.fmt.pix.height);
+-        return format.to_string();
+-    }
+-    default:
+-        throw std::runtime_error("Unsupported pixel format");
+-    }
++    return ctrl_->get_format().to_string();
+ }
+ 
+ std::string V4l2HwIdentification::get_serial() const {
+     std::stringstream ss;
+-    ss << ctrl_->get_capability().card;
++    ss << ctrl_->get_sensor_entity()->desc.name;
+     return ss.str();
+ }
+ std::string V4l2HwIdentification::get_integrator() const {
+@@ -93,4 +53,8 @@ std::string V4l2HwIdentification::get_connection_type() const {
+ DeviceConfigOptionMap V4l2HwIdentification::get_device_config_options_impl() const {
+     return {};
+ }
++
++RawFileHeader V4l2HwIdentification::get_header_impl() const {
++    return PseeRawFileHeader(*this);
+ }
++} // namespace Metavision
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_mmap_allocator.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_mmap_allocator.cpp
+index 6fdde35..2bad7ad 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_mmap_allocator.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_mmap_allocator.cpp
+@@ -31,6 +31,7 @@ V4l2DataTransfer::V4l2MmapAllocator::~V4l2MmapAllocator() {
+ void *V4l2DataTransfer::V4l2MmapAllocator::do_allocate(std::size_t bytes, std::size_t alignment) {
+     void *vaddr;
+     int buffer_index;
++    uint32_t length, offset;
+ 
+     if (bytes > max_byte_size())
+         throw std::length_error("Trying to expand allocation beyond V4L2 buffer length");
+@@ -44,15 +45,29 @@ void *V4l2DataTransfer::V4l2MmapAllocator::do_allocate(std::size_t bytes, std::s
+ 
+     // Query buffer information
+     V4l2Buffer buffer{};
+-    buffer.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    struct v4l2_plane plane;
++    buffer.type   = get_buf_type();
+     buffer.memory = V4L2_MEMORY_MMAP;
+     buffer.index  = buffer_index;
++    if (buffer.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++        buffer.length   = 1;
++        buffer.m.planes = &plane;
++    }
+ 
+     if (ioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0)
+         throw std::system_error(errno, std::generic_category(), "Could not query V4L2 buffer");
+ 
++    if (buffer.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
++        length = buffer.m.planes[0].length;
++        offset = buffer.m.planes[0].m.mem_offset;
++    } else {
++        // Assuming V4L2_BUF_TYPE_VIDEO_CAPTURE
++        length = buffer.length;
++        offset = buffer.m.offset;
++    }
++
+     // Map it in the program memory
+-    vaddr = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, buffer.m.offset);
++    vaddr = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, offset);
+     if (vaddr == MAP_FAILED)
+         throw std::system_error(errno, std::generic_category(), "Could not mmap V4L2 buffer");
+ 
+diff --git a/hal_psee_plugins/src/devices/v4l2/CMakeLists.txt b/hal_psee_plugins/src/devices/v4l2/CMakeLists.txt
+index e09cb64..b98901a 100644
+--- a/hal_psee_plugins/src/devices/v4l2/CMakeLists.txt
++++ b/hal_psee_plugins/src/devices/v4l2/CMakeLists.txt
+@@ -17,4 +17,5 @@ target_sources(metavision_psee_hw_layer_obj PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}/v4l2_erc.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/v4l2_roi_interface.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/v4l2_crop.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/v4l2_sync.cpp
+ )
+diff --git a/hal_psee_plugins/src/devices/v4l2/v4l2_crop.cpp b/hal_psee_plugins/src/devices/v4l2/v4l2_crop.cpp
+index 8cf80d2..45ff43d 100644
+--- a/hal_psee_plugins/src/devices/v4l2/v4l2_crop.cpp
++++ b/hal_psee_plugins/src/devices/v4l2/v4l2_crop.cpp
+@@ -15,8 +15,6 @@
+ 
+ namespace Metavision {
+ 
+-void raise_error(const std::string &str);
+-
+ V4L2Crop::V4L2Crop(std::shared_ptr<V4L2DeviceControl> device) : device_(device), enabled_(false) {
+     // set default crop to native size
+     device_->get_native_size(device_->get_sensor_entity()->fd, rect_);
+@@ -48,7 +46,6 @@ bool V4L2Crop::is_enabled() const {
+ }
+ 
+ bool V4L2Crop::set_mode(const Mode &mode) {
+-    raise_error("V4L2Crop::set_mode() not supported by device");
+     return false;
+ }
+ 
+@@ -61,7 +58,7 @@ size_t V4L2Crop::get_max_supported_windows_count() const {
+ }
+ 
+ bool V4L2Crop::set_lines(const std::vector<bool> &cols, const std::vector<bool> &rows) {
+-    throw std::runtime_error("V4L2Crop::set_lines() not implemented");
++    return false;
+ }
+ 
+ bool V4L2Crop::set_windows_impl(const std::vector<Window> &windows) {
+@@ -98,7 +95,7 @@ std::vector<I_ROI::Window> V4L2Crop::get_windows() const {
+ }
+ 
+ bool V4L2Crop::get_lines(std::vector<bool> &cols, std::vector<bool> &rows) const {
+-    throw std::runtime_error("V4L2Crop::set_lines() not implemented");
++    return false;
+ }
+ 
+ } // namespace Metavision
+diff --git a/hal_psee_plugins/src/devices/v4l2/v4l2_device_builder.cpp b/hal_psee_plugins/src/devices/v4l2/v4l2_device_builder.cpp
+index 85ecf92..593212c 100644
+--- a/hal_psee_plugins/src/devices/v4l2/v4l2_device_builder.cpp
++++ b/hal_psee_plugins/src/devices/v4l2/v4l2_device_builder.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "metavision/psee_hw_layer/devices/v4l2/v4l2_ll_biases.h"
+ #include "metavision/psee_hw_layer/devices/v4l2/v4l2_erc.h"
++#include "metavision/psee_hw_layer/devices/v4l2/v4l2_sync.h"
+ #include "metavision/psee_hw_layer/devices/v4l2/v4l2_roi_interface.h"
+ #include "metavision/psee_hw_layer/devices/v4l2/v4l2_crop.h"
+ 
+@@ -53,7 +54,7 @@ bool V4L2DeviceBuilder::build_device(std::shared_ptr<BoardCommand> cmd, DeviceBu
+     auto controls = ctrl->get_controls();
+ 
+     if (controls->has("bias")) {
+-        MV_HAL_LOG_TRACE() << "Found BIAS controls\n";
++        MV_HAL_LOG_TRACE() << "Found BIAS controls";
+         auto sensor_info = hw_identification->get_sensor_info();
+         bool relative    = false;
+         if (sensor_info.name_ == "IMX636") {
+@@ -62,6 +63,12 @@ bool V4L2DeviceBuilder::build_device(std::shared_ptr<BoardCommand> cmd, DeviceBu
+         device_builder.add_facility(std::make_unique<V4L2LLBiases>(config, controls, relative));
+     }
+ 
++    if (controls->has("sync"))
++    {
++        MV_HAL_LOG_TRACE() << "Found SYNC controls";
++        device_builder.add_facility(std::make_unique<V4l2Synchronization>(controls));
++    }
++    
+     if (controls->has("erc")) {
+         MV_HAL_LOG_TRACE() << "Found ERC controls";
+         device_builder.add_facility(std::make_unique<V4L2Erc>(controls));
+diff --git a/hal_psee_plugins/src/devices/v4l2/v4l2_ll_biases.cpp b/hal_psee_plugins/src/devices/v4l2/v4l2_ll_biases.cpp
+index c698ac6..84b224b 100644
+--- a/hal_psee_plugins/src/devices/v4l2/v4l2_ll_biases.cpp
++++ b/hal_psee_plugins/src/devices/v4l2/v4l2_ll_biases.cpp
+@@ -71,14 +71,24 @@ bool V4L2LLBiases::get_bias_info_impl(const std::string &bias_name, LL_Bias_Info
+ std::map<std::string, int> V4L2LLBiases::get_all_biases() const {
+     std::map<std::string, int> biases;
+ 
+-    controls_->foreach ([&biases](V4L2Controls::V4L2Control &ctrl) {
++    controls_->foreach ([&biases, this](V4L2Controls::V4L2Control &ctrl) {
+         auto name = std::string(ctrl.query_.name);
+         // skip non bias controls
+         if (name.find("bias_") != 0) {
+             return 0;
+         }
+ 
+-        biases[ctrl.query_.name] = ctrl.get_int().value_or(0xFFFFFFFF);
++        auto maybe_val = ctrl.get_int();
++        if (!maybe_val.has_value()) {
++            return 0;
++        }
++
++        if (relative_) {
++            biases[ctrl.query_.name] = *maybe_val - ctrl.query_.default_value;
++        } else {
++            biases[ctrl.query_.name] = *maybe_val;
++        }
++
+         return 0;
+     });
+ 
+diff --git a/hal_psee_plugins/src/devices/v4l2/v4l2_roi_interface.cpp b/hal_psee_plugins/src/devices/v4l2/v4l2_roi_interface.cpp
+index 1a7a66d..6c985d1 100644
+--- a/hal_psee_plugins/src/devices/v4l2/v4l2_roi_interface.cpp
++++ b/hal_psee_plugins/src/devices/v4l2/v4l2_roi_interface.cpp
+@@ -10,11 +10,10 @@
+  **********************************************************************************************************************/
+ 
+ #include "metavision/psee_hw_layer/devices/v4l2/v4l2_roi_interface.h"
++#include "metavision/hal/facilities/i_geometry.h"
+ 
+ namespace Metavision {
+ 
+-void raise_error(const std::string &str);
+-
+ V4L2RoiInterface::V4L2RoiInterface(std::shared_ptr<V4L2DeviceControl> device) : device_(device), enabled_(false) {
+     auto controls = device_->get_controls();
+     auto ctrl     = controls->get("roi_reset");
+@@ -24,11 +23,11 @@ V4L2RoiInterface::V4L2RoiInterface(std::shared_ptr<V4L2DeviceControl> device) :
+ }
+ 
+ int V4L2RoiInterface::device_width() const {
+-    return device_->get_width();
++    return device_->get_format().geometry()->get_width();
+ }
+ 
+ int V4L2RoiInterface::device_height() const {
+-    return device_->get_height();
++    return device_->get_format().geometry()->get_height();
+ }
+ 
+ bool V4L2RoiInterface::enable(bool state) {
+@@ -67,7 +66,7 @@ size_t V4L2RoiInterface::get_max_supported_windows_count() const {
+ }
+ 
+ bool V4L2RoiInterface::set_lines(const std::vector<bool> &cols, const std::vector<bool> &rows) {
+-    throw std::runtime_error("V4L2RoiInterface::set_lines() not implemented");
++    return false;
+ }
+ 
+ struct roi {
+@@ -126,7 +125,6 @@ std::vector<I_ROI::Window> V4L2RoiInterface::get_windows() const {
+ }
+ 
+ bool V4L2RoiInterface::get_lines(std::vector<bool> &cols, std::vector<bool> &rows) const {
+-    raise_error("V4L2RoiInterface::get_lines() not implemented");
+     return false;
+ }
+ 
+diff --git a/hal_psee_plugins/src/devices/v4l2/v4l2_sync.cpp b/hal_psee_plugins/src/devices/v4l2/v4l2_sync.cpp
+new file mode 100644
+index 0000000..7d910a4
+--- /dev/null
++++ b/hal_psee_plugins/src/devices/v4l2/v4l2_sync.cpp
+@@ -0,0 +1,79 @@
++/**********************************************************************************************************************
++ * Copyright (c) Prophesee S.A.                                                                                       *
++ *                                                                                                                    *
++ * Licensed under the Apache License, Version 2.0 (the "License");                                                    *
++ * you may not use this file except in compliance with the License.                                                   *
++ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0                                 *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed   *
++ * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.                      *
++ * See the License for the specific language governing permissions and limitations under the License.                 *
++ **********************************************************************************************************************/
++
++#include <fstream>
++#include <sstream>
++#include <iomanip>
++#include <cstdint>
++
++#include "metavision/psee_hw_layer/devices/v4l2/v4l2_sync.h"
++#include "metavision/psee_hw_layer/boards/v4l2/v4l2_controls.h"
++#include "metavision/hal/utils/hal_log.h"
++#include "metavision/hal/utils/hal_exception.h"
++
++namespace Metavision {
++
++V4l2Synchronization::V4l2Synchronization(std::shared_ptr<V4L2Controls> controls) : controls_(controls) {
++    // reset all erc controls to default values.
++    controls_->foreach ([&](V4L2Controls::V4L2Control &ctrl) {
++        auto name = std::string(ctrl.query_.name);
++        // skip non erc controls
++        if (name.find("sync_mode") != 0) {
++            return 0;
++        }
++        ctrl.reset();
++        return 0;
++    });
++}
++
++bool V4l2Synchronization::set_mode_standalone() {
++    auto ctrl = controls_->get("sync_mode");
++    auto smode = I_CameraSynchronization::SyncMode::STANDALONE;
++    int ret = ctrl.set_menu(static_cast<int>(smode));
++    if (ret != 0) {
++        MV_HAL_LOG_ERROR() << "Failed to set sync_mode Control value to STANDALONE";
++        return false;
++    }
++    MV_HAL_LOG_INFO() << "Set sync_mode Control value to STANDALONE";
++    return true;
++}
++
++bool V4l2Synchronization::set_mode_master() {
++    auto ctrl = controls_->get("sync_mode");
++    auto smode = I_CameraSynchronization::SyncMode::MASTER;
++    int ret = ctrl.set_menu(static_cast<int>(smode));
++    if (ret != 0) {
++        MV_HAL_LOG_ERROR() << "Failed to set sync_mode Control value to MASTER";
++        return false;
++    }
++    MV_HAL_LOG_INFO() << "Set sync_mode Control value to MASTER";
++    return true;
++}
++
++bool V4l2Synchronization::set_mode_slave() {
++    auto ctrl = controls_->get("sync_mode");
++    auto smode = I_CameraSynchronization::SyncMode::SLAVE;
++    int ret = ctrl.set_menu(static_cast<int>(smode));
++    if (ret != 0) {
++        MV_HAL_LOG_ERROR() << "Failed to set sync_mode Control value to SLAVE";
++        return false;
++    }
++    MV_HAL_LOG_INFO() << "Set sync_mode Control value to SLAVE";
++    return true;
++}
++
++I_CameraSynchronization::SyncMode V4l2Synchronization::get_mode() const {
++    auto ctrl = controls_->get("sync_mode");
++    int ret = *ctrl.get_int();
++    return I_CameraSynchronization::SyncMode(ret);
++}
++
++} // namespace Metavision
+diff --git a/sdk/modules/ui/cpp/lib/CMakeLists.txt b/sdk/modules/ui/cpp/lib/CMakeLists.txt
+index b96ed2d..eb9578b 100644
+--- a/sdk/modules/ui/cpp/lib/CMakeLists.txt
++++ b/sdk/modules/ui/cpp/lib/CMakeLists.txt
+@@ -42,25 +42,30 @@ if(USE_OPENGL_ES3)
+     if(NOT TARGET OpenGL::GLES3)
+         ## Previous to cmake 3.27, OpenGL ES targets were not supported...
+         ## Let's search for it
+-        find_library(GLES3_lib GLESv2) # GLES3 is a superset of GLES2 hence the GLESv2 library
++        find_library(GLESv2_lib GLESv2)
+         find_file(GLES3_header gl3.h PATH_SUFFIXES GLES3)
+         get_filename_component(GLES3_header_dir ${GLES3_header} DIRECTORY)
+-        if(GLES_lib MATCHES "NOTFOUND")
+-            message(NOTICE "The required OpenGL ES3 library is not found")
++
++        if(GLESv2_lib MATCHES "NOTFOUND")
++            message(NOTICE "The required OpenGL ES2/3 library (libGLESv2) is not found")
+             return()
+-        endif() 
++        endif()
++
+         if(GLES3_header MATCHES "NOTFOUND")
+-            message(NOTICE "Could not found OpenGL ES3 headers")
++            message(NOTICE "Could not find OpenGL ES3 headers (gl3.h)")
+             return()
+         endif()
+-        add_library(GLES3 UNKNOWN IMPORTED GLOBAL) 
+-        set_target_properties(GLES3 PROPERTIES 
+-            IMPORTED_LOCATION ${GLES3_lib}
++
++        add_library(GLESv2 UNKNOWN IMPORTED GLOBAL)
++        set_target_properties(GLESv2 PROPERTIES 
++            IMPORTED_LOCATION ${GLESv2_lib}
+             INTERFACE_INCLUDE_DIRECTORIES ${GLES3_header_dir}
+         )
+-        add_library(OpenGL::GLES3 ALIAS GLES3)
+-    endif()
+ 
++        # Provide a meaningful alias to indicate ES3 use, but still use GLESv2 library (as does GLES3)
++        add_library(OpenGL::GLES3 ALIAS GLESv2)
++    endif()
++    
+     target_link_libraries(metavision_sdk_ui PUBLIC OpenGL::GLES3)
+ else()
+     target_link_libraries(metavision_sdk_ui 
+@@ -68,6 +73,4 @@ else()
+             OpenGL::GL 
+             GLEW::GLEW
+     )
+-endif(USE_OPENGL_ES3)
+-
+-
++endif(USE_OPENGL_ES3)
+\ No newline at end of file
