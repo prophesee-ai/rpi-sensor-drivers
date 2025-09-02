@@ -8,9 +8,11 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
 1. Requirements:
     ``` bash
     sudo apt install raspberrypi-kernel-headers dkms
+    export RPI_SENSOR_DRIVERS_PATH=$(pwd)
     ```
 2. Install drivers with dkms:
     ``` bash
+    make prepare
     make all
     sudo dkms add .
     sudo dkms build psee_sensor_drivers/1.0
@@ -22,21 +24,21 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
     
     * Install dependencies:
     ``` bash
-        sudo apt update
-        sudo apt -y install apt-utils build-essential software-properties-common wget unzip curl git cmake
-        sudo apt -y install libopencv-dev libboost-all-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler
-        sudo apt -y install libhdf5-dev hdf5-tools libglew-dev libglfw3-dev libcanberra-gtk-module ffmpeg 
-        sudo apt -y install pybind11-dev
+    sudo apt update
+    sudo apt -y install apt-utils build-essential software-properties-common wget unzip curl git cmake
+    sudo apt -y install libopencv-dev libboost-all-dev libusb-1.0-0-dev libprotobuf-dev protobuf-compiler
+    sudo apt -y install libhdf5-dev hdf5-tools libglew-dev libglfw3-dev libcanberra-gtk-module ffmpeg 
+    sudo apt -y install pybind11-dev
     ```
     * Install patched openeb (the same would apply for metavision)
     ``` bash
-        git clone https://github.com/prophesee-ai/openeb.git --branch 5.1.1 --single-branch
-        cd openeb 
-        git apply ${RPI_SENSOR_DRIVERS_PATH}/openeb-for-rpi.patch
-        mkdir build && cd build
-        cmake .. -DUSE_OPENGL_ES3=ON -DCMAKE_BUILD_TYPE=Release
-        cmake --build . --config Release -- -j 4
-        sudo make install
+    git clone https://github.com/prophesee-ai/openeb.git --branch 5.1.1 --single-branch
+    cd openeb 
+    git apply ${RPI_SENSOR_DRIVERS_PATH}/openeb-for-rpi.patch
+    mkdir build && cd build
+    cmake .. -DUSE_OPENGL_ES3=ON -DCMAKE_BUILD_TYPE=Release
+    cmake --build . --config Release -- -j 4
+    sudo make install
     ```
 
 # Usage
@@ -54,7 +56,7 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
 2. Setup formats/links/parameters for v4l:
     ``` bash
     # this script is located within this repository. It configures v4l for any found/known sensor.
-    ./rp5_setup_v4l.sh
+    ./${RPI_SENSOR_DRIVERS_PATH}/rp5_setup_v4l.sh
     ```
 3. Environment variables:
     > We make use of 2 environment variables to finetune aspects of the acquisition pipeline:
@@ -76,7 +78,6 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
     > To retrieve valid data, the mipi frames have to be cut at mipi frame end markers (which we inject on the sensor side).
     > 
     > --> mipi frame end markers are encoded as "OTHER" events. They vary for event formats:
-    > - EVT3: E019
+    > - EVT3: 0xE019
     > - EVT21: 0xEXXXX019XXXXXXXX (X - variable)
-
-    ```
+    > - EVT2: 0xEXXXXX19
