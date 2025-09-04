@@ -56,7 +56,7 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
 2. Setup formats/links/parameters for v4l:
     ``` bash
     # this script is located within this repository. It configures v4l for any found/known sensor.
-    .${RPI_SENSOR_DRIVERS_PATH}/rp5_setup_v4l.sh
+    ${RPI_SENSOR_DRIVERS_PATH}/rp5_setup_v4l.sh
     ```
 3. Environment variables:
     > We make use of 2 environment variables to finetune aspects of the acquisition pipeline:
