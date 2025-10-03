@@ -67,7 +67,7 @@
 				rotation = <180>;
 				orientation = <2>;
 
-				rstn-delay-ms = <285>;
+				rstn-delay-ms = <385>;
 
 				port {
 					genx320_0: endpoint {
