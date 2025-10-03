@@ -67,7 +67,7 @@
 				rotation = <180>;
 				orientation = <2>;
 
-				rstn-delay-ms = <285>;
+				rstn-delay-ms = <385>;
 
 				port {
 					imx636_0: endpoint {

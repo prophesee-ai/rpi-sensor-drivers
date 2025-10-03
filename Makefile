@@ -18,6 +18,7 @@ drivers:
 prepare:
 	@echo "Cloning Drivers..."
 	git clone --branch kernel-6.12 https://github.com/prophesee-ai/linux-sensor-drivers.git drivers
+	git -C drivers checkout 7165d5e69ebed78dcc63b36e1d0f451c42aa7aaa
 #	touch drivers/.patched
 
 psee_sensors: drivers

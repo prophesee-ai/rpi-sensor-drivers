@@ -8,6 +8,8 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
 1. Requirements:
     ``` bash
     sudo apt install raspberrypi-kernel-headers dkms
+    # raspberrypi-kernel-headers is not available any more on trixie. 
+    # sudo apt install "linux-headers-$(uname -r)"
     RPI_SENSOR_DRIVERS_PATH=$(pwd)
     ```
 2. Install drivers with dkms:
@@ -15,8 +17,8 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
     make prepare
     make all
     sudo dkms add .
-    sudo dkms build psee_sensor_drivers/1.0
-    sudo dkms install psee_sensor_drivers/1.0
+    sudo dkms build psee_sensor_drivers/1.0.1
+    sudo dkms install psee_sensor_drivers/1.0.1
     ```
 3. Install support software: [openeb](https://github.com/prophesee-ai/openeb.git)/5.1.1:
 
@@ -76,6 +78,7 @@ It uses prophesee's [linux-sensor-drivers](https://github.com/prophesee-ai/linux
     > the data recorded will contain invalid chunks, because our sensors output variable amounts of data that is stored in fixed size mipi frames (4096x391).
     >
     > To retrieve valid data, the mipi frames have to be cut at mipi frame end markers (which we inject on the sensor side).
+    > This cut is applied in openeb and controlled via environment variable: PSEE_VAR_V4L2_BSIZE
     > 
     > --> mipi frame end markers are encoded as "OTHER" events. They vary for event formats:
     > - EVT3: 0xE019
